@@ -1,0 +1,2 @@
+# servermove_chara
+
