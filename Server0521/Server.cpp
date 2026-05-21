@@ -43,7 +43,7 @@ bool RecvPacket(SOCKET sock, string& outJson)
     outJson = string(body, bodyLen);
     return true;
 }
-
+  
 bool SendPacket(SOCKET sock, const string& jsonStr)
 {
     char header[3];
