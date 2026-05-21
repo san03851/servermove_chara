@@ -13,17 +13,54 @@
 
 using json = nlohmann::json;
 using namespace std;
+
 const int HEADER_SIZE = 2;
 const int BUFFER_SIZE = 1024;
 const int MAP_WIDTH = 24;
 const int MAP_HEIGHT = 24;
+const int MAX_PLAYERS = 4;
+
+const char PLAYER_SYMBOLS[MAX_PLAYERS] = { 'A', 'B', 'C', 'D' };
+
+struct PlayerInfo
+{
+    int id = 0;
+    int x = -1;
+    int y = -1;
+    bool active = false;
+};
 
 int myId = 0;
-int myX = 0, myY = 0;
-int otherX = -1, otherY = -1;
+PlayerInfo players[MAX_PLAYERS];
 bool running = true;
 
 CRITICAL_SECTION cs;
+
+int FindPlayerIndex(int id)
+{
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        if (players[i].id == id) return i;
+    }
+    return -1;
+}
+
+int RegisterPlayer(int id)
+{
+    int idx = FindPlayerIndex(id);
+    if (idx >= 0) return idx;
+
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        if (!players[i].active && players[i].id == 0)
+        {
+            players[i].id = id;
+            players[i].active = true;
+            return i;
+        }
+    }
+    return -1;
+}
 
 bool RecvExact(SOCKET sock, char* buf, int n)
 {
@@ -79,24 +116,17 @@ void RenderMap()
     SetConsoleCursorInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci);
 
     string screen;
-    screen.reserve(2000);
+    screen.reserve(3000);
 
     screen += "+";
     for (int x = 0; x < MAP_WIDTH; ++x) screen += "--";
     screen += "+\n";
 
     EnterCriticalSection(&cs);
-    int p1x = 0, p1y = 0, p2x = 0, p2y = 0;
-    if (myId == 1)
-    {
-        p1x = myX; p1y = myY;
-        p2x = otherX; p2y = otherY;
-    }
-    else
-    {
-        p1x = otherX; p1y = otherY;
-        p2x = myX; p2y = myY;
-    }
+    PlayerInfo localPlayers[MAX_PLAYERS];
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+        localPlayers[i] = players[i];
+    int localMyId = myId;
     LeaveCriticalSection(&cs);
 
     for (int y = 0; y < MAP_HEIGHT; ++y)
@@ -104,11 +134,19 @@ void RenderMap()
         screen += "|";
         for (int x = 0; x < MAP_WIDTH; ++x)
         {
-            if (x == p1x && y == p1y)
-                screen += "P ";
-            else if (x == p2x && y == p2y)
-                screen += "W ";
-            else
+            bool drawn = false;
+            for (int p = 0; p < MAX_PLAYERS; ++p)
+            {
+                if (localPlayers[p].active &&
+                    localPlayers[p].x == x && localPlayers[p].y == y)
+                {
+                    screen += PLAYER_SYMBOLS[p];
+                    screen += ' ';
+                    drawn = true;
+                    break;
+                }
+            }
+            if (!drawn)
                 screen += ". ";
         }
         screen += "|\n";
@@ -117,11 +155,33 @@ void RenderMap()
     screen += "+";
     for (int x = 0; x < MAP_WIDTH; ++x) screen += "--";
     screen += "+\n";
+    int myIdx = -1;
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        if (localPlayers[i].id == localMyId)
+        {
+            myIdx = i;
+            break;
+        }
+    }
 
-    if (myId == 0)
-        screen += "You are [P] | Other is [W]          \n";
-    else if (myId == 1)
-        screen += "You are [W] | Other is [P]          \n";
+    screen += "You are [";
+    if (myIdx >= 0) screen += PLAYER_SYMBOLS[myIdx];
+    else screen += '?';
+    screen += "] | Players: ";
+
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        if (localPlayers[i].active)
+        {
+            screen += PLAYER_SYMBOLS[i];
+            if (localPlayers[i].id == localMyId)
+                screen += "(me) ";
+            else
+                screen += " ";
+        }
+    }
+    screen += "          \n";
 
     screen += "Move: W A S D | Q to quit              \n";
     screen += "                                        \n";
@@ -145,31 +205,45 @@ unsigned WINAPI RecvThread(void* arg)
 
         try
         {
-            json j = json::parse(jsonStr);
-            string type = j["type"].get<string>();
+            json jRecv = json::parse(jsonStr);
+            string type = jRecv["type"].get<string>();
 
             if (type == "init")
             {
                 EnterCriticalSection(&cs);
-                myId = j["id"].get<int>();
+                myId = jRecv["id"].get<int>();
                 LeaveCriticalSection(&cs);
             }
             else if (type == "move")
             {
-                int id = j["id"].get<int>();
-                int x = j["x"].get<int>();
-                int y = j["y"].get<int>();
+                int id = jRecv["id"].get<int>();
+                int x = jRecv["x"].get<int>();
+                int y = jRecv["y"].get<int>();
 
                 EnterCriticalSection(&cs);
-                if (id == myId)
+                int idx = RegisterPlayer(id);
+                if (idx >= 0)
                 {
-                    myX = x;
-                    myY = y;
+                    players[idx].x = x;
+                    players[idx].y = y;
+                    players[idx].active = true;
                 }
-                else
+                LeaveCriticalSection(&cs);
+
+                RenderMap();
+            }
+            else if (type == "leave")
+            {
+                int id = jRecv["id"].get<int>();
+
+                EnterCriticalSection(&cs);
+                int idx = FindPlayerIndex(id);
+                if (idx >= 0)
                 {
-                    otherX = x;
-                    otherY = y;
+                    players[idx].active = false;
+                    players[idx].id = 0;
+                    players[idx].x = -1;
+                    players[idx].y = -1;
                 }
                 LeaveCriticalSection(&cs);
 
@@ -185,6 +259,14 @@ unsigned WINAPI RecvThread(void* arg)
 int main()
 {
     InitializeCriticalSection(&cs);
+
+    for (int i = 0; i < MAX_PLAYERS; ++i)
+    {
+        players[i].id = 0;
+        players[i].x = -1;
+        players[i].y = -1;
+        players[i].active = false;
+    }
 
     char serverIP[64] = { 0 };
     cout << "Server IP (Enter for 127.0.0.1): ";
@@ -216,19 +298,9 @@ int main()
         string jsonStr;
         if (RecvPacket(sock, jsonStr))
         {
-            json j = json::parse(jsonStr);
-            myId = j["id"].get<int>();
-            if (myId == 1)
-            {
-                myX = 2; myY = 2;
-            }
-            else
-            {
-                myX = 17; myY = 12;
-            }
-            cout << "Assigned ID: " << myId;
-            if (myId == 1) cout << " (P)" << endl;
-            else           cout << " (W)" << endl;
+            json jRecv = json::parse(jsonStr);
+            myId = jRecv["id"].get<int>();
+            cout << "Assigned ID: " << myId << endl;
         }
     }
 
@@ -243,55 +315,27 @@ int main()
         {
             int key = _getch();
 
-            if (key == 'w' || key == 'W')
+            if (key == 'w' || key == 'W' ||
+                key == 'a' || key == 'A' ||
+                key == 's' || key == 'S' ||
+                key == 'd' || key == 'D')
             {
-                EnterCriticalSection(&cs);
-                if (myY > 0) myY--;
-                LeaveCriticalSection(&cs);
-            }
-            else if (key == 's' || key == 'S')
-            {
-                EnterCriticalSection(&cs);
-                if (myY < MAP_HEIGHT - 1) myY++;
-                LeaveCriticalSection(&cs);
-            }
-            else if (key == 'a' || key == 'A')
-            {
-                EnterCriticalSection(&cs);
-                if (myX > 0) myX--;
-                LeaveCriticalSection(&cs);
-            }
-            else if (key == 'd' || key == 'D')
-            {
-                EnterCriticalSection(&cs);
-                if (myX < MAP_WIDTH - 1) myX++;
-                LeaveCriticalSection(&cs);
+                json jInput;
+                jInput["type"] = "input";
+                jInput["dir"] = string(1, (char)toupper(key));
+                string inputStr = jInput.dump();
+                if (!SendPacket(sock, inputStr))
+                {
+                    cout << "\nSend failed!" << endl;
+                    running = false;
+                    break;
+                }
             }
             else if (key == 'q' || key == 'Q')
             {
                 running = false;
                 break;
             }
-            else
-            {
-                continue;
-            }
-
-            EnterCriticalSection(&cs);
-            json j;
-            j["type"] = "move";
-            j["id"] = myId;
-            j["x"] = myX;
-            j["y"] = myY;
-            LeaveCriticalSection(&cs);
-
-            if (!SendPacket(sock, j.dump()))
-            {
-                cout << "\nSend failed!" << endl;
-                running = false;
-                break;
-            }
-            RenderMap();
         }
         Sleep(16);
     }

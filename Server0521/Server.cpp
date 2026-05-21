@@ -10,10 +10,12 @@
 
 using json = nlohmann::json;
 using namespace std;
+
 const int HEADER_SIZE = 2;
 const int BUFFER_SIZE = 1024;
 const int MAP_WIDTH = 24;
 const int MAP_HEIGHT = 24;
+const int MAX_PLAYERS = 4;
 
 bool RecvExact(SOCKET sock, char* buf, int n)
 {
@@ -61,11 +63,22 @@ bool SendPacket(SOCKET sock, const string& jsonStr)
 struct ClientInfo
 {
     SOCKET sock = INVALID_SOCKET;
-    int id = 0;       // 1 = P, 2 = W, 3 = o
+    int id = 0;
     int x = 0;
     int y = 0;
     bool connected = false;
 };
+
+void Broadcast(ClientInfo clients[], int count, const string& msg)
+{
+    for (int k = 0; k < count; ++k)
+    {
+        if (clients[k].connected)
+        {
+            SendPacket(clients[k].sock, msg);
+        }
+    }
+}
 
 int main()
 {
@@ -83,17 +96,11 @@ int main()
     ::bind(listenSocket, (SOCKADDR*)&addr, sizeof(addr));
     listen(listenSocket, SOMAXCONN);
 
-    ClientInfo clients[10];
-    clients[0].id = 1; clients[0].x = 0;  clients[0].y = 12;
-    clients[1].id = 2; clients[1].x = 10; clients[1].y = 22;
-    //clients[2].id = 3; clients[1].x = 57; clients[1].y = 17;
-    //clients[3].id = 4; clients[1].x = 67; clients[1].y = 43;
-    //clients[4].id = 5; clients[1].x = 77; clients[1].y = 53;
-    //clients[5].id = 6; clients[1].x = 27; clients[1].y = 15;
-    //clients[6].id = 7; clients[1].x = 37; clients[1].y = 24;
-    //clients[7].id = 8; clients[1].x = 47; clients[1].y = 74;
-    //clients[8].id = 9; clients[1].x = 80; clients[1].y = 80;
-    //clients[9].id = 10; clients[1].x = 99; clients[1].y = 99;
+    ClientInfo clients[MAX_PLAYERS];
+    clients[0].id = 1; clients[0].x = 1;  clients[0].y = 1;
+    clients[1].id = 2; clients[1].x = 22; clients[1].y = 1;
+    clients[2].id = 3; clients[2].x = 1;  clients[2].y = 22;
+    clients[3].id = 4; clients[3].x = 22; clients[3].y = 22;
 
     int clientCount = 0;
 
@@ -105,6 +112,8 @@ int main()
     FD_ZERO(&readSet);
     FD_SET(listenSocket, &readSet);
 
+    cout << "Server started on port 35000 (max " << MAX_PLAYERS << " players)" << endl;
+
     while (true)
     {
         fd_set copySet = readSet;
@@ -114,7 +123,7 @@ int main()
 
         if (FD_ISSET(listenSocket, &copySet))
         {
-            if (clientCount < 2)
+            if (clientCount < MAX_PLAYERS)
             {
                 SOCKADDR_IN clientAddr;
                 int len = sizeof(clientAddr);
@@ -124,36 +133,39 @@ int main()
                 clients[clientCount].connected = true;
                 clientCount++;
 
-                cout << "Client " << clientCount << " connected: "
+                cout << "Player " << clientCount << " connected: "
                     << inet_ntoa(clientAddr.sin_addr) << endl;
 
                 FD_SET(clientSock, &readSet);
 
-                json initJ;
-                initJ["type"] = "init";
-                initJ["id"] = clients[clientCount - 1].id;
-                SendPacket(clientSock, initJ.dump());
-                if (clientCount >= 0)
                 {
-                    for (int k = 0; k < 2; ++k)
-                    {
-                        json m1;
-                        m1["type"] = "move";
-                        m1["id"] = clients[0].id;
-                        m1["x"] = clients[0].x;
-                        m1["y"] = clients[0].y;
-                        SendPacket(clients[k].sock, m1.dump());
+                    json jInit;
+                    jInit["type"] = "init";
+                    jInit["id"] = clients[clientCount - 1].id;
+                    string initStr = jInit.dump();
+                    SendPacket(clientSock, initStr);
+                }
 
-                        json m2;
-                        m2["type"] = "move";
-                        m2["id"] = clients[1].id;
-                        m2["x"] = clients[1].x;
-                        m2["y"] = clients[1].y;
-                        SendPacket(clients[k].sock, m2.dump());
+                for (int k = 0; k < clientCount; ++k)
+                {
+                    if (!clients[k].connected) continue;
+
+                    for (int p = 0; p < clientCount; ++p)
+                    {
+                        if (!clients[p].connected) continue;
+
+                        json jSync;
+                        jSync["type"] = "move";
+                        jSync["id"] = clients[p].id;
+                        jSync["x"] = clients[p].x;
+                        jSync["y"] = clients[p].y;
+                        string syncStr = jSync.dump();
+                        SendPacket(clients[k].sock, syncStr);
                     }
                 }
             }
         }
+
         for (int i = 0; i < clientCount; ++i)
         {
             if (!clients[i].connected) continue;
@@ -162,33 +174,57 @@ int main()
             string jsonStr;
             if (!RecvPacket(clients[i].sock, jsonStr))
             {
-                cout << "Client " << clients[i].id << " disconnected." << endl;
+                cout << "Player " << clients[i].id << " disconnected." << endl;
                 FD_CLR(clients[i].sock, &readSet);
                 closesocket(clients[i].sock);
                 clients[i].connected = false;
+
+                {
+                    json jLeave;
+                    jLeave["type"] = "leave";
+                    jLeave["id"] = clients[i].id;
+                    string leaveStr = jLeave.dump();
+                    Broadcast(clients, clientCount, leaveStr);
+                }
                 continue;
             }
 
             try
             {
-                json j = json::parse(jsonStr);
-                string type = j["type"].get<string>();
+                json jRecv = json::parse(jsonStr);
+                string type = jRecv["type"].get<string>();
 
-                if (type == "move")
+                if (type == "input")
                 {
-                    clients[i].x = j["x"].get<int>();
-                    clients[i].y = j["y"].get<int>();
+                    string dir = jRecv["dir"].get<string>();
+
+                    int newX = clients[i].x;
+                    int newY = clients[i].y;
+
+                    if (dir == "W")      newY--;
+                    else if (dir == "S") newY++;
+                    else if (dir == "A") newX--;
+                    else if (dir == "D") newX++;
+                    else continue;
+
+                    if (newX < 0 || newX >= MAP_WIDTH ||
+                        newY < 0 || newY >= MAP_HEIGHT)
+                        continue;
+
+                    clients[i].x = newX;
+                    clients[i].y = newY;
 
                     cout << "Player " << clients[i].id
-                        << " -> (" << clients[i].x << ", " << clients[i].y << ")" << endl;
+                        << " -> (" << newX << ", " << newY << ")" << endl;
 
-                    string broadcastStr = j.dump();
-                    for (int k = 0; k < clientCount; ++k)
                     {
-                        if (clients[k].connected)
-                        {
-                            SendPacket(clients[k].sock, broadcastStr);
-                        }
+                        json jMove;
+                        jMove["type"] = "move";
+                        jMove["id"] = clients[i].id;
+                        jMove["x"] = newX;
+                        jMove["y"] = newY;
+                        string moveStr = jMove.dump();
+                        Broadcast(clients, clientCount, moveStr);
                     }
                 }
             }
@@ -199,7 +235,7 @@ int main()
         }
     }
 
-	closesocket(listenSocket);
-	WSACleanup();
-	return 0;
+    closesocket(listenSocket);
+    WSACleanup();
+    return 0;
 }
